@@ -9,21 +9,27 @@ on:
         type: string
 
 permissions:
-  contents: write       # Needed to push the downloaded file
+  contents: write          # required to push the file(s)
 
 jobs:
   download-vsix:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Get extension metadata and download VSIX
-        id: fetch
+      - name: Fetch extension, split if needed, commit and push
+        id: fetch_and_push
         env:
           EXT_ID: ${{ inputs.extension_id }}
+        shell: bash
         run: |
-          # 1. Query the Marketplace for the latest version
+          # Log everything to a file and also show it in the workflow output
+          exec > >(tee -a debug.log) 2>&1
+          set -x
+
+          # 1. Query the Marketplace API ------------------------------------------------
           RESPONSE=$(curl -s -X POST "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery" \
             -H "Content-Type: application/json" \
             -H "Accept: application/json;api-version=3.0-preview.1" \
@@ -35,7 +41,6 @@ jobs:
               "flags": 131
             }')
 
-          # 2. Extract the download URL (first VSIX asset) and version number
           DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.results[0].extensions[0].versions[0].files[] | select(.assetType=="Microsoft.VisualStudio.Services.VSIXPackage") | .source')
           VERSION=$(echo "$RESPONSE" | jq -r '.results[0].extensions[0].versions[0].version')
 
@@ -47,19 +52,107 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
 
-          # 3. Download the VSIX into the repo root
-          FILE_NAME="${EXT_ID}-${VERSION}.vsix"
-          echo "file_name=$FILE_NAME" >> $GITHUB_OUTPUT
+          # 2. Download the VSIX ---------------------------------------------------------
+          FILE_BASENAME="${EXT_ID}-${VERSION}"
+          VSIX_NAME="${FILE_BASENAME}.vsix"
+          curl -L -o "$VSIX_NAME" "$DOWNLOAD_URL"
 
-          curl -L -o "$FILE_NAME" "$DOWNLOAD_URL"
-          echo "VSIX saved as $FILE_NAME"
+          # 3. Check file size and split if > 100 MiB ------------------------------------
+          VSIX_SIZE=$(stat -c%s "$VSIX_NAME")
+          echo "original_size=$VSIX_SIZE" >> $GITHUB_OUTPUT
 
-      - name: Commit and push VSIX file
-        env:
-          FILE_NAME: ${{ steps.fetch.outputs.file_name }}
-        run: |
+          MAX_SIZE=$((100 * 1024 * 1024))   # 100 MiB
+
+          CREATED_FILES=""
+
+          if [ "$VSIX_SIZE" -gt "$MAX_SIZE" ]; then
+            echo "File size ($VSIX_SIZE bytes) exceeds 100 MiB. Splitting into 95 MiB multi-part ZIP."
+
+            SPLIT_ZIP_BASE="${FILE_BASENAME}.zip"
+
+            # Create split archive – each part max 95 MiB (standard zip multi-part)
+            zip -s 95m "$SPLIT_ZIP_BASE" "$VSIX_NAME"
+
+            # Remove the original VSIX; only the split parts remain
+            rm -f "$VSIX_NAME"
+
+            # Collect all parts (.zip + .z01, .z02, …)
+            SPLIT_PARTS=$(ls "${FILE_BASENAME}.zip" "${FILE_BASENAME}.z"* 2>/dev/null | sort)
+            if [ -z "$SPLIT_PARTS" ]; then
+              SPLIT_PARTS="${FILE_BASENAME}.zip"
+            fi
+
+            echo "Split files: $SPLIT_PARTS"
+            CREATED_FILES="$SPLIT_PARTS"
+            echo "split=true" >> $GITHUB_OUTPUT
+            echo "split_base=$SPLIT_ZIP_BASE" >> $GITHUB_OUTPUT
+          else
+            echo "File size ($VSIX_SIZE bytes) within limit – keeping original VSIX."
+            CREATED_FILES="$VSIX_NAME"
+            echo "split=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "created_files=$CREATED_FILES" >> $GITHUB_OUTPUT
+          echo "$CREATED_FILES" > created_files.txt
+
+          # 4. Commit and push to the repo ------------------------------------------------
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$FILE_NAME"
-          git commit -m "Add $FILE_NAME" || echo "No changes to commit"
+          git add $CREATED_FILES
+          git commit -m "Add $EXT_ID VSIX (v$VERSION)" || echo "No changes to commit"
           git push
+
+      - name: Generate Summary
+        if: always()    # run even if the previous step fails, so you can see the logs
+        env:
+          EXT_ID: ${{ inputs.extension_id }}
+          VERSION: ${{ steps.fetch_and_push.outputs.version }}
+          ORIGINAL_SIZE: ${{ steps.fetch_and_push.outputs.original_size }}
+          SPLIT: ${{ steps.fetch_and_push.outputs.split }}
+          SPLIT_BASE: ${{ steps.fetch_and_push.outputs.split_base }}
+        run: |
+          {
+            echo "## 📦 VSIX Fetch Summary"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Extension | \`$EXT_ID\` |"
+            echo "| Version | \`$VERSION\` |"
+            echo "| Original file size | \`$ORIGINAL_SIZE\` bytes ($(numfmt --to=iec $ORIGINAL_SIZE 2>/dev/null || echo $ORIGINAL_SIZE bytes)) |"
+            echo ""
+
+            if [ "$SPLIT" = "true" ]; then
+              echo "> ⚠️ The file exceeded 100 MiB and was **split** into multi-part ZIP archives (95 MiB each)."
+              echo ""
+              echo "### 📎 Download Links (split parts)"
+              while read -r f; do
+                fsize=$(stat -c%s "$f")
+                echo "- [\`$f\`](https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/$f) ($(numfmt --to=iec $fsize 2>/dev/null || echo $fsize bytes))"
+              done < created_files.txt
+              echo ""
+              echo "**🔧 Reassembly instructions:**"
+              echo "Download all parts into the same folder, then run:"
+              echo '```bash'
+              echo "# Combine parts and extract"
+              echo "cat ${SPLIT_BASE%.zip}.z* ${SPLIT_BASE} > combined.zip"
+              echo "unzip combined.zip"
+              echo '```'
+              echo "Or simply open \`$SPLIT_BASE\` with **7‑Zip** / **WinRAR** – it will automatically recognise the multi‑part archive."
+            else
+              echo "### 📎 Download Link"
+              while read -r f; do
+                fsize=$(stat -c%s "$f")
+                echo "- [\`$f\`](https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/$f) ($(numfmt --to=iec $fsize 2>/dev/null || echo $fsize bytes))"
+              done < created_files.txt
+            fi
+
+            echo ""
+            echo "---"
+            echo "### 🐞 Debug Log"
+            echo "<details><summary>Click to expand full log</summary>"
+            echo ""
+            echo '```'
+            cat debug.log
+            echo '```'
+            echo "</details>"
+          } >> $GITHUB_STEP_SUMMARY
